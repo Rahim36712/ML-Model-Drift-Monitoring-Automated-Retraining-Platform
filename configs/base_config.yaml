@@ -1,0 +1,35 @@
+project:
+  name: "MLOps Drift Monitor"
+  version: "1.0.0"
+
+database:
+  url: "sqlite:///data/predictions.db"
+
+mlflow:
+  tracking_uri: "sqlite:///mlruns/mlflow.db"
+  experiment_name: "drift-monitor"
+  artifact_location: "./models"
+  model_name: "FraudDetector"
+
+model:
+  type: "RandomForestClassifier"
+  params:
+    n_estimators: 200
+    max_depth: 15
+    min_samples_split: 5
+    class_weight: "balanced"
+    random_state: 42
+
+api:
+  host: "0.0.0.0"
+  port: 8000
+
+dashboard:
+  host: "0.0.0.0"
+  port: 8050
+  refresh_interval_ms: 5000
+
+monitoring:
+  check_interval_minutes: 5
+  window_size: 500
+  min_samples: 100
