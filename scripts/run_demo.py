@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python
+#!/usr/bin/env python
 """Run the complete MLOps platform demo.
 
 Ensures baseline model is trained, pre-populates the SQLite database with 
@@ -150,10 +150,10 @@ def main() -> None:
         stderr=subprocess.DEVNULL
     )
     
-    # 4. Start Dash Dashboard
-    logger.info("Starting Dash monitoring dashboard on port 8050...")
+    # 4. Start Streamlit Monitoring Dashboard (Stitch Lime Green & Off-White UI)
+    logger.info("Starting Streamlit monitoring dashboard on port 8050...")
     dash_proc = subprocess.Popen(
-        [sys.executable, "-m", "src.dashboard.app"],
+        [sys.executable, "-m", "streamlit", "run", "src/dashboard_streamlit/app.py", "--server.port", "8050", "--server.headless", "true"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL
     )
