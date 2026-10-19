@@ -7,6 +7,7 @@
 [![MLflow](https://img.shields.io/badge/MLflow-Tracking%20%26%20Registry-0194E2?style=for-the-badge&logo=mlflow&logoColor=white)](https://mlflow.org/)
 [![Plotly Dash](https://img.shields.io/badge/Dashboard-Plotly%20Dash-3F4F75?style=for-the-badge&logo=plotly&logoColor=white)](https://dash.plotly.com/)
 [![Scikit-Learn](https://img.shields.io/badge/ML-Scikit--Learn-F7931E?style=for-the-badge&logo=scikitlearn&logoColor=white)](https://scikit-learn.org/)
+[![Tests](https://img.shields.io/badge/Tests-16%20Passed-brightgreen?style=for-the-badge&logo=pytest&logoColor=white)](#-automated-testing)
 [![Evidently AI](https://img.shields.io/badge/Drift_Monitoring-Statistical%20Metrics-6C5CE7?style=for-the-badge)](src/decision/)
 [![Architecture](https://img.shields.io/badge/Deployment-Zero--Downtime%20Hot%20Swap-2ECC71?style=for-the-badge)](#-zero-downtime-champion-vs-challenger-pipeline)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)](LICENSE)
@@ -148,6 +149,20 @@ python -m src.dashboard.app
 # 4. Stream simulated production traffic
 python scripts/simulate_production.py
 ```
+
+### 4. 🧪 Automated Testing
+
+Run the full automated test suite verifying statistical drift computations, decision rules, telemetry logging, FastAPI prediction endpoints, and retraining deployment:
+
+```bash
+python -m pytest tests/
+```
+All **16 automated test suites** execute in `< 5s` verifying:
+- Feature data drift detection (Population Stability Index & KL divergence)
+- Output prediction drift calculation (Hellinger distance)
+- Telemetry database persistence and thread-safe logging
+- FastAPI REST inference contract (`/predict`, `/feedback`, `/monitoring/drift`)
+- Retraining pipeline and champion model promotion logic
 
 ---
 
