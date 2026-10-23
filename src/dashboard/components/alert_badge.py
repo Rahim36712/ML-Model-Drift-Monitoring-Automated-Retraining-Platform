@@ -61,6 +61,13 @@ def create_status_indicator(status: str) -> html.Span:
         to a neutral gray dot.
     """
 
-    dot_class = _STATUS_DOT.get(status.lower(), "status-dot status-dot-gray")
+    status_clean = status.lower()
+    dot_class = _STATUS_DOT.get(status_clean, "status-dot status-dot-gray")
+    status_label = f"Status: {status_clean}"
 
-    return html.Span(className=dot_class)
+    return html.Span(
+        className=dot_class,
+        role="img",
+        title=status_label,
+        **{"aria-label": status_label},
+    )

@@ -15,7 +15,13 @@ def create_metric_card(
     return dbc.Card(
         dbc.CardBody(
             [
-                html.Div(icon, className="metric-icon"),
+                html.Div(
+                    icon,
+                    className="metric-icon",
+                    role="img",
+                    title=f"{title} icon",
+                    **{"aria-label": f"{title} icon"},
+                ),
                 html.Div(title, className="metric-title"),
                 html.Div("-", id=f"{card_id}-value", className="metric-value"),
                 html.Div(
@@ -29,6 +35,9 @@ def create_metric_card(
                             "",
                             id=f"{card_id}-status",
                             className="status-dot status-dot-gray ms-2",
+                            role="img",
+                            title="Metric status",
+                            **{"aria-label": "Metric status"},
                         ),
                     ],
                     className="d-flex align-items-center mt-1",
