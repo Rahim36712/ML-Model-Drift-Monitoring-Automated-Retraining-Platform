@@ -122,6 +122,17 @@ python -m pytest -q
 python -m build
 ```
 
-CI defines Python 3.11/3.12 on Windows/Linux and a Docker startup/restart check. Local observed
-results, screenshots, and unverified platform checks are recorded in [validation](docs/manual_validation.md).
-The previous README's static test badge was removed; use actual test results.
+CI checks Python 3.11/3.12 on Windows/Linux and exercises a real Docker lifecycle and restart.
+See the [latest verification evidence](docs/validation/2026-10-31/README.md),
+[browser validation and screenshots](docs/manual_validation.md), and the draft PR's checks.
+
+With the application running, verify the complete lifecycle from another terminal using the
+same environment configuration:
+
+```sh
+python -m scripts.smoke_test --report lifecycle.json
+```
+
+This submits 500 synthetic predictions with labels, checks drift, and follows real challenger
+evaluation. Rejection is a valid result when the quality gates fail. For a read-only readiness
+check, use `python -m scripts.smoke_test --check-only`.

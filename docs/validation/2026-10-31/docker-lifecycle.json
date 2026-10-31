@@ -1,0 +1,17 @@
+{
+  "timestamp": "2026-10-31T18:41:04.417134+00:00",
+  "services_ready": true,
+  "traffic_job": "6df9952eff7047d991de959af242b49f",
+  "training_job": "ef05504db7d04fb5b97a5e85ed47c5f9",
+  "training_outcome": "REJECTED",
+  "gate_passed": false,
+  "drift_status": "critical",
+  "detector_checks": [
+    "data_drift",
+    "prediction_drift",
+    "concept_drift"
+  ],
+  "active_version": 1,
+  "prediction_count": 500,
+  "worker_online": true
+}
