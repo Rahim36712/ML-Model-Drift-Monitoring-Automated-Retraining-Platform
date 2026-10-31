@@ -1,0 +1,8 @@
+{
+  "python": "3.11.9",
+  "isolated_package_directory": true,
+  "numpy_imported": "1.26.4",
+  "pandas_imported": "2.2.3",
+  "scipy_imported": "1.14.1",
+  "mlflow_imported": "2.19.0"
+}

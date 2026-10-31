@@ -1,0 +1,18 @@
+{
+  "results": [
+    {
+      "python": "3.11.9",
+      "platform": "Windows",
+      "passed": 40,
+      "warnings": 17,
+      "duration_seconds": 81.14
+    },
+    {
+      "python": "3.12.14",
+      "platform": "Windows",
+      "passed": 40,
+      "warnings": 23,
+      "duration_seconds": 96.23
+    }
+  ]
+}

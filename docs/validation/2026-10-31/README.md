@@ -9,7 +9,8 @@
 - Restart verification preserved version 1 and all 500 retained predictions, with the worker online.
 - See [lifecycle evidence](python312-lifecycle.json) and [restart evidence](python312-restart.json).
 - Python 3.11.9 is installed in an isolated package directory. Locked dependencies pass
-  `pip check`, and NumPy, pandas, SciPy, and MLflow import successfully. Its tests are in progress.
+  `pip check`, and NumPy, pandas, SciPy, and MLflow import successfully. **40 tests passed**,
+  17 upstream warnings, 81.14 seconds. See [test evidence](python-test-results.json).
 
 ## Changes made during follow-up
 
