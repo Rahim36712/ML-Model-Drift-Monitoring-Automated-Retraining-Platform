@@ -25,7 +25,12 @@ mlflow.db
 mlflow-artifacts/
 
 # Model artifacts
-models/
+/models/
+data/demo/
+data/test-runtime/
+*.log
+.pytest_cache/
+.ruff_cache/
 
 # IDE
 .vscode/

@@ -27,7 +27,8 @@ from typing import Any
 
 import yaml
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+from src.runtime import home, sqlite_url
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +78,12 @@ class ThresholdPair(BaseModel):
 
     warning: float
     critical: float
+
+    @model_validator(mode="after")
+    def valid_thresholds(self):
+        if not 0 <= self.warning < self.critical:
+            raise ValueError("Thresholds must satisfy 0 <= warning < critical")
+        return self
 
 
 class DataDriftThresholds(BaseModel):
@@ -152,6 +159,9 @@ class MonitoringSettings(BaseModel):
     check_interval_minutes: int = 5
     window_size: int = 500
     min_samples: int = 100
+    cooldown_minutes: int = 10
+    min_labeled_samples: int = 100
+    min_class_samples: int = 5
 
 
 class APISettings(BaseModel):
@@ -223,6 +233,12 @@ class AlertingSettings(BaseModel):
 # Top-level settings
 # ===================================================================
 
+class PromotionSettings(BaseModel):
+    min_f1_improvement: float = 0.005
+    max_historical_f1_drop: float = 0.01
+    max_recall_drop: float = 0.02
+
+
 class Settings(BaseModel):
     """Root settings object that aggregates every configuration section.
 
@@ -230,6 +246,7 @@ class Settings(BaseModel):
     lifetime of the process.
     """
 
+    promotion: PromotionSettings = Field(default_factory=PromotionSettings)
     project: ProjectSettings = Field(default_factory=ProjectSettings)
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)
     mlflow: MLflowSettings = Field(default_factory=MLflowSettings)
@@ -326,9 +343,12 @@ def get_settings() -> Settings:
         logger.info("Loaded .env from %s", dotenv_path)
 
     # --- YAML files ---------------------------------------------------
-    base_cfg = _load_yaml(PROJECT_ROOT / "configs" / "base_config.yaml")
-    drift_cfg = _load_yaml(PROJECT_ROOT / "configs" / "drift_thresholds.yaml")
-    alert_cfg = _load_yaml(PROJECT_ROOT / "configs" / "alerting_config.yaml")
+    config_dir = PROJECT_ROOT / "configs"
+    if not config_dir.exists():
+        config_dir = Path(__file__).parent / "defaults"
+    base_cfg = _load_yaml(config_dir / "base_config.yaml")
+    drift_cfg = _load_yaml(config_dir / "drift_thresholds.yaml")
+    alert_cfg = _load_yaml(config_dir / "alerting_config.yaml")
 
     # --- Merge into a single dict matching Settings schema ------------
     merged: dict[str, Any] = {
@@ -344,7 +364,20 @@ def get_settings() -> Settings:
     }
 
     # --- Env-var overrides --------------------------------------------
+    merged["database"]["url"] = sqlite_url(home() / "telemetry.db")
+    merged["mlflow"]["tracking_uri"] = sqlite_url(home() / "mlflow.db")
+    merged["mlflow"]["artifact_location"] = (home() / "mlartifacts").as_uri()
+    merged["promotion"] = base_cfg.get("promotion", {})
     merged = _apply_env_overrides(merged)
+    for section in ["database", "mlflow"]:
+        key = "url" if section == "database" else "tracking_uri"
+        uri = merged[section][key]
+        if uri.startswith("sqlite:///") and ":memory:" not in uri:
+            path = Path(uri.removeprefix("sqlite:///"))
+            if not path.is_absolute():
+                path = PROJECT_ROOT / path
+            merged[section][key] = sqlite_url(path)
+
 
     settings = Settings.model_validate(merged)
     logger.info(

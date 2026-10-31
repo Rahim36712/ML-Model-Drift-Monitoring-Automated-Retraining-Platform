@@ -1,267 +1,364 @@
-"""FastAPI application factory.
+"""Local serving API. One serving process owns activation and rollback."""
 
-Initialises the database, MLflow model registry, in-memory serving cache,
-drift detection detectors, alerting channels, and periodic scheduler.
-"""
-
-from __future__ import annotations
-
-import logging
 from contextlib import asynccontextmanager
-from typing import Any
-
+from datetime import datetime, timezone
+import json
+import logging
+import secrets
+import time
+from typing import Literal
 import numpy as np
-
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from apscheduler.schedulers.background import BackgroundScheduler
-
+from fastapi import FastAPI, Depends, Header, HTTPException, Query, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+from sqlalchemy import text
+from src.api.schemas import PredictionRequest, BatchPredictionRequest, GroundTruthRequest
 from src.config.settings import get_settings
-from src.data.database import get_database, ModelVersion
+from src.data.database import get_database, Prediction, ModelVersion, Alert
 from src.data.logger import PredictionLogger
-from src.data.loader import DataLoader
-from src.models.trainer import ModelTrainer
-from src.models.evaluator import ModelEvaluator
+from src.jobs import JobQueue
+from src.models.bundle import FEATURES
 from src.models.registry import ModelRegistry
-from src.monitoring.data_drift import DataDriftDetector
-from src.monitoring.prediction_drift import PredictionDriftDetector
-from src.monitoring.concept_drift import ConceptDriftDetector
-from src.monitoring.drift_manager import DriftManager
-from src.alerting.alert_manager import AlertManager
-from src.decision.retraining_engine import RetrainingDecisionEngine
-from src.pipeline.deployer import ModelDeployer, ModelProvider
-from src.pipeline.retrain_pipeline import RetrainingPipeline
-
-from src.api.middleware import TimingMiddleware, RequestLoggingMiddleware, global_exception_handler
-from src.api.routes import health, predictions, monitoring, models
+from src.pipeline.deployer import ModelProvider, ModelDeployer
+from src.runtime import management_token
+from src.service import monitor, dashboard_snapshot, serial
 
 logger = logging.getLogger(__name__)
 
 
-def schedule_periodic_drift_check(app: FastAPI) -> None:
-    """Run periodic data, prediction, and concept drift check via scheduler."""
-    settings = app.state.settings
-    db = app.state.db
-    drift_mgr = app.state.drift_manager
-    retraining_engine = app.state.retraining_engine
-    retrain_pipeline = app.state.retrain_pipeline
-
-    logger.info("Executing scheduled periodic drift check...")
-    
-    try:
-        pred_logger = PredictionLogger(db)
-        recent_predictions = pred_logger.get_recent_predictions(settings.monitoring.window_size)
-        
-        if len(recent_predictions) < settings.monitoring.min_samples:
-            logger.info(
-                "Scheduled drift check skipped: insufficient prediction logs (%d/%d).",
-                len(recent_predictions),
-                settings.monitoring.min_samples,
-            )
-            return
-
-        feature_names = DataLoader.get_feature_names()
-        summary = drift_mgr.run_drift_check(recent_predictions, feature_names)
-
-        # Evaluate retraining decision rules
-        decision = retraining_engine.evaluate(summary)
-        retraining_engine.record_decision(decision)
-        
-        if decision.should_retrain:
-            logger.warning(
-                "Scheduled drift check triggered retraining! Reason: %s",
-                decision.reason,
-            )
-            # Run retraining
-            retrain_pipeline.execute(decision.reason)
-            
-    except Exception:
-        logger.exception("Scheduled periodic drift check failed.")
+def require_management(x_mlops_token: str = Header(default="")):
+    if not secrets.compare_digest(x_mlops_token, management_token()):
+        raise HTTPException(401, "Management authentication required")
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Lifespan context manager handling FastAPI startup and shutdown routines."""
-    logger.info("Starting up MLOps Serving API...")
-    
-    # 1. Load configuration
+class DemoAction(BaseModel):
+    scenario: Literal["stable", "drift"] = "stable"
+    samples: int = Field(default=500, ge=100, le=2000)
+
+
+class Feedback(BaseModel):
+    prediction_id: int
+    true_label: Literal[0, 1]
+
+
+class FeedbackBatch(BaseModel):
+    labels: list[Feedback] = Field(min_length=1, max_length=1000)
+
+
+class ResetRequest(BaseModel):
+    confirmation: Literal["RESET DEMO"]
+
+
+def create_app():
     settings = get_settings()
-    app.state.settings = settings
-
-    # 2. Setup Database & Logger
     db = get_database(settings.database.url)
     db.init_db()
-    app.state.db = db
+    queue = JobQueue(db)
 
-    # 3. Setup MLflow registry
-    registry = ModelRegistry(settings)
-    app.state.registry = registry
+    @asynccontextmanager
+    async def lifespan(app):
+        from src.process_lock import process_lock
+        from src.runtime import home
 
-    # 4. Try loading the production model into serving cache (ModelProvider)
-    prod_version_row = None
-    try:
+        with process_lock(home() / "api.lock"):
+            ModelProvider.set_active_model(None, None, None)
+            registry = ModelRegistry(settings)
+            app.state.deployer = ModelDeployer(settings, db, registry)
+            with db.get_session() as session:
+                row = session.query(ModelVersion).filter_by(is_production=True).one_or_none()
+                version = row.version if row else None
+            if version is not None and not app.state.deployer.deploy(version):
+                logger.error("Persisted champion unavailable; readiness remains false")
+            yield
+
+    app = FastAPI(title="DriftWatch · Fraud Monitoring", version="2.0.0", lifespan=lifespan)
+    app.state.db, app.state.settings, app.state.queue = db, settings, queue
+    app.state.snapshot_cache = {}
+
+    @app.middleware("http")
+    async def latency(request, call_next):
+        start = time.perf_counter()
+        response = await call_next(request)
+        elapsed = (time.perf_counter() - start) * 1000
+        response.headers["X-Process-Time"] = f"{elapsed:.3f}ms"
+        ids = getattr(request.state, "prediction_ids", [])
+        if ids:
+            with db.get_session() as session:
+                session.query(Prediction).filter(Prediction.id.in_(ids)).update(
+                    {"request_latency_ms": elapsed}, synchronize_session=False
+                )
+        return response
+
+    @app.exception_handler(Exception)
+    async def unexpected(request, exc):
+        logger.exception("Unhandled API error", exc_info=exc)
+        return JSONResponse(
+            status_code=500, content={"detail": "An internal error occurred; inspect service logs."}
+        )
+
+    @app.get("/health")
+    def health():
+        with db.engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+        return {
+            "status": "ok",
+            "db_connected": True,
+            "model_version": ModelProvider.get_snapshot().version,
+            "timestamp": datetime.now(timezone.utc),
+        }
+
+    @app.get("/ready")
+    def ready():
+        connected = True
+        try:
+            with db.engine.connect() as connection:
+                connection.execute(text("SELECT 1"))
+        except Exception:
+            connected = False
+        value = {
+            "ready": ModelProvider.is_loaded() and connected,
+            "db_connected": connected,
+            "model_version": ModelProvider.get_snapshot().version,
+        }
+        return JSONResponse(status_code=200 if value["ready"] else 503, content=value)
+
+    def infer(items, request, source="api", scenario="live"):
+        snapshot = ModelProvider.get_snapshot()
+        if snapshot.model is None:
+            raise HTTPException(503, "No model is loaded. Train the baseline first.")
+        start = time.perf_counter()
+        X = np.array([[item.features[name] for name in FEATURES] for item in items], dtype=float)
+        if snapshot.preprocessor is not None:
+            X[:, 28] = snapshot.preprocessor.transform(X[:, 28].reshape(-1, 1)).ravel()
+        probabilities = snapshot.model.predict_proba(X)[:, 1]
+        labels = snapshot.model.predict(X)
+        elapsed = (time.perf_counter() - start) * 1000 / len(items)
+        stamp = datetime.now(timezone.utc)
         with db.get_session() as session:
-            prod_version_row = (
-                session.query(ModelVersion)
-                .filter(ModelVersion.is_production == True)
-                .one_or_none()
-            )
-        
-        if prod_version_row:
-            logger.info("Loading production model version %d from registry...", prod_version_row.version)
-            prod_model = registry.load_model(version=prod_version_row.version)
-            loader = DataLoader()
-            preprocessor = loader.load_preprocessor()
-            ModelProvider.set_active_model(
-                model=prod_model,
-                preprocessor=preprocessor,
-                version=prod_version_row.version,
-                mlflow_run_id=prod_version_row.mlflow_run_id
-            )
-        else:
-            logger.warning("No production model marked in DB. Server starting without pre-loaded model.")
-    except Exception:
-        logger.exception("Error loading active production model at startup. API will be degraded.")
-
-    # 5. Initialize alerting & decision engine
-    alert_mgr = AlertManager(db)
-    app.state.alert_manager = alert_mgr
-    
-    retraining_engine = RetrainingDecisionEngine(settings.drift_thresholds, db)
-    app.state.retraining_engine = retraining_engine
-
-    # 6. Initialize drift detectors & manager
-    try:
-        loader = DataLoader()
-        ref_data = loader.load_reference_distribution()
-        
-        # Load baseline model details for Hellinger and metric comparisons
-        # If reference distribution and preprocessor exist, we initialize detectors
-        data_detector = DataDriftDetector(ref_data, settings.drift_thresholds.data_drift)
-        
-        # Set up prediction and concept detectors from real production state
-        # when available. The deterministic fallback keeps cold starts usable.
-        pred_logger = PredictionLogger(db)
-        baseline_window = pred_logger.get_recent_predictions(settings.monitoring.window_size)
-        if len(baseline_window) >= settings.monitoring.min_samples:
-            baseline_preds = np.array([p.predicted_label for p in baseline_window], dtype=np.int64)
-            baseline_confs = np.array([p.confidence for p in baseline_window], dtype=np.float64)
-        else:
-            baseline_preds = np.zeros(settings.monitoring.window_size, dtype=np.int64)
-            baseline_confs = np.ones(settings.monitoring.window_size, dtype=np.float64) * 0.95
-
-        prediction_detector = PredictionDriftDetector(
-            baseline_predictions=baseline_preds,
-            baseline_confidences=baseline_confs,
-            thresholds=settings.drift_thresholds.prediction_drift
-        )
-
-        if prod_version_row:
-            baseline_metrics = {
-                "accuracy": float(prod_version_row.accuracy),
-                "f1": float(prod_version_row.f1_score),
-                "precision": float(prod_version_row.precision),
-                "recall": float(prod_version_row.recall),
+            rows = [
+                Prediction(
+                    features_json=json.dumps(item.features),
+                    predicted_label=int(label),
+                    confidence=float(probability),
+                    model_version=str(snapshot.version),
+                    latency_ms=elapsed,
+                    timestamp=stamp,
+                    source=source,
+                    scenario=scenario,
+                )
+                for item, label, probability in zip(items, labels, probabilities)
+            ]
+            session.add_all(rows)
+            session.flush()
+            ids = [row.id for row in rows]
+        request.state.prediction_ids = ids
+        return [
+            {
+                "prediction_id": row_id,
+                "predicted_label": int(label),
+                "confidence": float(probability),
+                "model_version": str(snapshot.version),
+                "latency_ms": elapsed,
+                "timestamp": stamp,
             }
-        else:
-            baseline_metrics = {"accuracy": 0.98, "f1": 0.95, "precision": 0.96, "recall": 0.94}
-        concept_detector = ConceptDriftDetector(
-            baseline_metrics=baseline_metrics,
-            thresholds=settings.drift_thresholds.concept_drift
+            for row_id, label, probability in zip(ids, labels, probabilities)
+        ]
+
+    @app.post("/predict")
+    def predict(payload: PredictionRequest, request: Request):
+        return infer([payload], request)[0]
+
+    @app.post("/predict/batch")
+    def batch(payload: BatchPredictionRequest, request: Request):
+        return {"predictions": infer(payload.predictions, request)}
+
+    @app.post("/demo/predict/batch", dependencies=[Depends(require_management)])
+    def demo_batch(
+        payload: BatchPredictionRequest,
+        request: Request,
+        scenario: Literal["stable", "drift"] = "stable",
+    ):
+        return {"predictions": infer(payload.predictions, request, "demo", scenario)}
+
+    @app.post("/ground-truth/batch")
+    def feedback_batch(payload: FeedbackBatch):
+        with db.get_session() as session:
+            ids = [item.prediction_id for item in payload.labels]
+            rows = {
+                row.id: row
+                for row in session.query(Prediction).filter(Prediction.id.in_(ids)).all()
+            }
+            if len(rows) != len(set(ids)):
+                raise HTTPException(404, "One or more predictions were not found")
+            for item in payload.labels:
+                rows[item.prediction_id].true_label = item.true_label
+        return {"success": True, "count": len(ids)}
+
+    @app.post("/ground-truth/{prediction_id}")
+    def ground_truth(prediction_id: int, payload: GroundTruthRequest):
+        if not PredictionLogger(db).log_ground_truth(prediction_id, payload.true_label):
+            raise HTTPException(404, "Prediction not found")
+        return {"success": True, "prediction_id": prediction_id, "true_label": payload.true_label}
+
+    @app.get("/predictions/stats")
+    def stats():
+        return PredictionLogger(db).get_prediction_stats()
+
+    @app.get("/predictions")
+    def predictions(limit: int = Query(100, ge=1, le=1000), model_version: str | None = None):
+        return [
+            serial(row)
+            for row in PredictionLogger(db).get_predictions(
+                model_version=model_version, limit=limit
+            )
+        ]
+
+    @app.get("/models/current")
+    def current():
+        with db.get_session() as session:
+            row = session.query(ModelVersion).filter_by(is_production=True).one_or_none()
+            if row is None:
+                raise HTTPException(404, "No champion registered")
+            return serial(row)
+
+    @app.get("/models/versions")
+    def versions():
+        with db.get_session() as session:
+            return [
+                serial(row)
+                for row in session.query(ModelVersion).order_by(ModelVersion.version.desc()).all()
+            ]
+
+    @app.post("/models/retrain", status_code=202, dependencies=[Depends(require_management)])
+    def retrain():
+        job, created = queue.enqueue("Manual showcase retraining")
+        return {"job_id": job["id"], "created": created, "status": job["status"]}
+
+    @app.get("/jobs", dependencies=[Depends(require_management)])
+    def jobs():
+        return queue.list()
+
+    @app.get("/jobs/{job_id}", dependencies=[Depends(require_management)])
+    def job(job_id: str):
+        row = queue.get(job_id)
+        if not row:
+            raise HTTPException(404, "Job not found")
+        return row
+
+    def activate(version, request):
+        with db.get_session() as session:
+            if session.query(ModelVersion).filter_by(version=version).one_or_none() is None:
+                raise HTTPException(404, "Model version not found")
+        if not hasattr(request.app.state, "deployer"):
+            raise HTTPException(503, "Deployer not initialized")
+        if not request.app.state.deployer.deploy(version):
+            raise HTTPException(409, "Activation failed; previous serving snapshot retained")
+        queue.state(
+            "drift",
+            {
+                "overall_status": "unavailable",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "model_version": version,
+                "window": None,
+                "message": "New version: generate traffic and run a drift check",
+            },
         )
+        return {"success": True, "version": version}
 
-        drift_mgr = DriftManager(
-            db=db,
-            data_detector=data_detector,
-            prediction_detector=prediction_detector,
-            concept_detector=concept_detector
-        )
-        app.state.drift_manager = drift_mgr
-        logger.info("DriftManager and detectors successfully initialized.")
-    except Exception:
-        logger.exception("Failed to initialize drift detectors at startup (probably missing reference data).")
-        # Initialize a degraded DriftManager without detectors to avoid crashing server startup
-        app.state.drift_manager = DriftManager(db=db)
+    @app.post("/internal/models/activate/{version}", dependencies=[Depends(require_management)])
+    def internal_activate(version: int, request: Request):
+        return activate(version, request)
 
-    # 7. Initialize training & retraining pipeline components
-    trainer = ModelTrainer(settings)
-    evaluator = ModelEvaluator()
-    deployer = ModelDeployer(settings, db, registry)
-    app.state.deployer = deployer
-    
-    retrain_pipeline = RetrainingPipeline(
-        settings=settings,
-        db=db,
-        trainer=trainer,
-        evaluator=evaluator,
-        registry=registry,
-        deployer=deployer,
-        alert_manager=alert_mgr,
-    )
-    app.state.retrain_pipeline = retrain_pipeline
+    @app.post("/models/rollback/{version}", dependencies=[Depends(require_management)])
+    def rollback(version: int, request: Request):
+        if any(
+            row["status"] in ["RUNNING", "EVALUATING", "DEPLOYING", "QUEUED"]
+            for row in queue.list()
+        ):
+            raise HTTPException(409, "Wait for the active job before rollback")
+        return activate(version, request)
 
-    # 8. Start APScheduler background monitor checks
-    scheduler = BackgroundScheduler()
-    app.state.scheduler = scheduler
-    
-    # Run a drift check every check_interval_minutes
-    interval_min = settings.monitoring.check_interval_minutes
-    scheduler.add_job(
-        schedule_periodic_drift_check,
-        "interval",
-        minutes=interval_min,
-        args=[app],
-        id="scheduled_drift_check",
-        replace_existing=True,
-    )
-    scheduler.start()
-    logger.info("APScheduler started: periodic drift checks run every %d minutes.", interval_min)
+    @app.post("/drift/run", dependencies=[Depends(require_management)])
+    def run_drift():
+        try:
+            return monitor(db, settings)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
 
-    yield
+    @app.get("/drift/latest")
+    @app.get("/model-health")
+    def latest():
+        return queue.state("drift") or {
+            "overall_status": "unavailable",
+            "message": "No drift checks yet",
+        }
 
-    # Shutdown routines
-    logger.info("Shutting down MLOps Serving API...")
-    if hasattr(app.state, "scheduler"):
-        app.state.scheduler.shutdown(wait=False)
-        logger.info("APScheduler stopped.")
+    @app.get("/drift/history")
+    def history(limit: int = Query(50, ge=1, le=300)):
+        from src.data.database import DriftResult
 
+        with db.get_session() as session:
+            return [
+                serial(row)
+                for row in session.query(DriftResult)
+                .order_by(DriftResult.timestamp.desc())
+                .limit(limit)
+                .all()
+            ]
 
-def create_app() -> FastAPI:
-    """App factory creating and configuring FastAPI instance."""
-    import numpy as np # Ensure numpy is available in namespace
-    
-    app = FastAPI(
-        title="MLOps Prediction & Serving API",
-        description="Production serving layer for credit card fraud detection with real-time drift monitoring.",
-        version="1.0.0",
-        lifespan=lifespan,
-    )
+    @app.get("/alerts")
+    def alerts():
+        with db.get_session() as session:
+            return [
+                serial(row)
+                for row in session.query(Alert).order_by(Alert.timestamp.desc()).limit(200).all()
+            ]
 
-    # CORS configuration
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+    @app.post("/alerts/{alert_id}/acknowledge", dependencies=[Depends(require_management)])
+    def acknowledge(alert_id: int):
+        with db.get_session() as session:
+            row = session.get(Alert, alert_id)
+            if row is None:
+                raise HTTPException(404, "Alert not found")
+            row.acknowledged = True
+        return {"success": True}
 
-    # Logging and Timing Middlewares
-    app.add_middleware(RequestLoggingMiddleware)
-    app.add_middleware(TimingMiddleware)
+    @app.get("/dashboard/snapshot", dependencies=[Depends(require_management)])
+    def overview(model_version: str | None = None, hours: int = Query(24, ge=1, le=720)):
+        key = (model_version, hours)
+        cached = app.state.snapshot_cache.get(key)
+        if cached and time.monotonic() - cached[0] < 1:
+            return cached[1]
+        value = jsonable_encoder(dashboard_snapshot(db, settings, model_version, hours))
+        if len(app.state.snapshot_cache) > 30:
+            app.state.snapshot_cache.clear()
+        app.state.snapshot_cache[key] = (time.monotonic(), value)
+        return value
 
-    # Exception Handler
-    app.add_exception_handler(Exception, global_exception_handler)
+    @app.post("/demo/traffic", status_code=202, dependencies=[Depends(require_management)])
+    def demo(payload: DemoAction):
+        if not ModelProvider.is_loaded():
+            raise HTTPException(409, "Train a baseline before generating traffic")
+        job, created = queue.enqueue(json.dumps(payload.model_dump()), "traffic")
+        return {"job_id": job["id"], "created": created}
 
-    # Include Routers
-    app.include_router(health.router)
-    app.include_router(predictions.router)
-    app.include_router(monitoring.router)
-    app.include_router(models.router)
+    @app.post("/demo/reset", dependencies=[Depends(require_management)])
+    def reset(payload: ResetRequest):
+        with db.engine.connect() as connection:
+            connection.execute(text("BEGIN IMMEDIATE"))
+            if connection.execute(
+                text(
+                    "SELECT COUNT(*) FROM jobs WHERE status IN ('QUEUED','RUNNING','EVALUATING','DEPLOYING')"
+                )
+            ).scalar():
+                raise HTTPException(409, "Wait for active jobs before resetting demo telemetry")
+            connection.execute(text("DELETE FROM predictions WHERE source='demo'"))
+            connection.execute(text("DELETE FROM runtime_state WHERE key='drift'"))
+            connection.commit()
+        return {
+            "success": True,
+            "message": "Generated demo predictions cleared. Models and audit history preserved.",
+        }
 
     return app
-
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("app:create_app", host="0.0.0.0", port=8000, reload=True)

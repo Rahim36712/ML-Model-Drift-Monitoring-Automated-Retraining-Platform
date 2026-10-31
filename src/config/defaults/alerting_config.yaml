@@ -1,0 +1,27 @@
+alerting:
+  # Default channel - always active
+  console:
+    enabled: true
+    log_level: "INFO"
+
+  # Slack - opt-in, requires SLACK_WEBHOOK_URL env var
+  slack:
+    enabled: false
+    webhook_url: ""  # Override via SLACK_WEBHOOK_URL env var
+    channel: "#ml-alerts"
+    username: "MLOps Monitor"
+    icon_emoji: ":robot_face:"
+
+  # Email - opt-in, requires SMTP env vars
+  email:
+    enabled: false
+    smtp_host: ""
+    smtp_port: 587
+    smtp_user: ""
+    smtp_password: ""
+    from_address: "mlops-monitor@example.com"
+    to_addresses: []
+
+  # Alert deduplication
+  deduplication:
+    window_minutes: 30  # Don't re-alert for same metric within this window

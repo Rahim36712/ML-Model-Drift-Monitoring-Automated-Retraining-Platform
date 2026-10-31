@@ -26,6 +26,16 @@ def layout() -> html.Div:
                 "Real-time monitoring of model health, data drift, and prediction quality.",
                 style={"color": _TEXT_MUTED, "marginBottom": "1.5rem"},
             ),
+            dbc.Alert(
+                [
+                    html.Strong("Reading this dashboard: "),
+                    "PSI tracks feature shifts; F1 requires ground-truth labels. ",
+                    "Empty charts mean no measurements are available. ",
+                    "Drift status does not confirm that the prediction API is ready.",
+                ],
+                color="info",
+                className="mb-4",
+            ),
             dbc.Row(
                 [
                     dbc.Col(

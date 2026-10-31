@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 import numpy as np
+from functools import lru_cache
 
 from src.config.settings import DataDriftThresholds
 
@@ -126,24 +127,32 @@ class DataDriftDetector:
             Non-negative PSI value.  Values ≤ 0.1 generally indicate
             no significant shift; 0.1–0.25 is moderate; > 0.25 is large.
         """
-        epsilon = DataDriftDetector._EPSILON
+        p, q = DataDriftDetector._probabilities(expected, actual, bins)
+        return float(np.sum((q - p) * np.log(q / p)))
 
-        # Quantile edges from the reference distribution
-        quantiles = np.linspace(0.0, 1.0, bins + 1)
-        bin_edges = np.quantile(expected, quantiles)
-        # Ensure unique edges (collapse duplicates) so np.histogram works
-        bin_edges = np.unique(bin_edges)
+    @staticmethod
+    @lru_cache(maxsize=128)
+    def _reference_histogram(raw, bins):
+        expected = np.frombuffer(raw, dtype=np.float64)
+        if len(expected) == 0 or not np.isfinite(expected).all():
+            raise ValueError("Reference samples must be nonempty and finite")
+        inner = np.unique(np.quantile(expected, np.linspace(0, 1, bins + 1)[1:-1]))
+        if len(np.unique(expected)) == 1:
+            value = expected[0]
+            inner = np.array([np.nextafter(value, -np.inf), np.nextafter(value, np.inf)])
+        edges = np.r_[-np.inf, inner, np.inf]
+        counts = np.histogram(expected, edges)[0].astype(float) + 1e-6
+        return edges, counts / counts.sum()
 
-        expected_counts = np.histogram(expected, bins=bin_edges)[0].astype(np.float64)
-        actual_counts = np.histogram(actual, bins=bin_edges)[0].astype(np.float64)
-
-        expected_pct = expected_counts / expected_counts.sum() + epsilon
-        actual_pct = actual_counts / actual_counts.sum() + epsilon
-
-        psi: float = float(
-            np.sum((actual_pct - expected_pct) * np.log(actual_pct / expected_pct))
-        )
-        return psi
+    @staticmethod
+    def _probabilities(expected, actual, bins):
+        expected = np.asarray(expected, dtype=np.float64).ravel()
+        actual = np.asarray(actual, dtype=np.float64).ravel()
+        if bins < 2 or len(actual) == 0 or not np.isfinite(actual).all():
+            raise ValueError("Current samples must be nonempty and finite; bins >= 2")
+        edges, p = DataDriftDetector._reference_histogram(expected.tobytes(), bins)
+        counts = np.histogram(actual, edges)[0].astype(float) + 1e-6
+        return p, counts / counts.sum()
 
     @staticmethod
     def calculate_kl_divergence(
@@ -165,20 +174,8 @@ class DataDriftDetector:
         Returns:
             Non-negative KL divergence value (in nats).
         """
-        epsilon = DataDriftDetector._EPSILON
-
-        quantiles = np.linspace(0.0, 1.0, bins + 1)
-        bin_edges = np.quantile(expected, quantiles)
-        bin_edges = np.unique(bin_edges)
-
-        p_counts = np.histogram(expected, bins=bin_edges)[0].astype(np.float64)
-        q_counts = np.histogram(actual, bins=bin_edges)[0].astype(np.float64)
-
-        p = p_counts / p_counts.sum() + epsilon
-        q = q_counts / q_counts.sum() + epsilon
-
-        kl: float = float(np.sum(p * np.log(p / q)))
-        return kl
+        p, q = DataDriftDetector._probabilities(expected, actual, bins)
+        return float(max(0.0, np.sum(p * np.log(p / q))))
 
     # ---- main entry point --------------------------------------------
 
@@ -202,9 +199,15 @@ class DataDriftDetector:
             ValueError: If *feature_names* contains an unknown feature.
         """
         current_data = np.asarray(current_data, dtype=np.float64)
+        if current_data.size == 0 or not np.isfinite(current_data).all():
+            raise ValueError("Current feature samples must be nonempty and finite")
         if current_data.ndim == 1:
             current_data = current_data.reshape(-1, 1)
 
+        if current_data.ndim != 2 or current_data.shape[1] != len(feature_names):
+            raise ValueError("Feature matrix shape does not match schema")
+        if set(feature_names) - set(self._reference):
+            raise ValueError("Unknown reference feature")
         feature_psi: dict[str, float] = {}
         feature_kl: dict[str, float] = {}
         drifted_features: list[str] = []
@@ -225,15 +228,15 @@ class DataDriftDetector:
             feature_psi[name] = psi_val
             feature_kl[name] = kl_val
 
-            if psi_val >= self._thresholds.psi.warning:
+            if psi_val >= self._thresholds.psi.warning or kl_val >= self._thresholds.kl_divergence.warning:
                 drifted_features.append(name)
 
         overall_psi = max(feature_psi.values()) if feature_psi else 0.0
 
         # Determine severity from the worst-case PSI
-        if overall_psi >= self._thresholds.psi.critical:
+        if overall_psi >= self._thresholds.psi.critical or max(feature_kl.values(), default=0) >= self._thresholds.kl_divergence.critical:
             severity = "critical"
-        elif overall_psi >= self._thresholds.psi.warning:
+        elif overall_psi >= self._thresholds.psi.warning or max(feature_kl.values(), default=0) >= self._thresholds.kl_divergence.warning:
             severity = "warning"
         else:
             severity = "none"

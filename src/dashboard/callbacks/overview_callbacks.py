@@ -169,10 +169,11 @@ def update_psi_trend(_n):
             rows = (
                 session.query(DriftResult)
                 .filter(DriftResult.drift_type == "data", DriftResult.metric_name == "psi")
-                .order_by(DriftResult.timestamp)
+                .order_by(desc(DriftResult.timestamp), desc(DriftResult.id))
                 .limit(100)
                 .all()
             )
+        rows = list(reversed(rows))
         if rows:
             timestamps = [r.timestamp for r in rows]
             values = [r.metric_value for r in rows]
@@ -191,7 +192,14 @@ def update_psi_trend(_n):
     except Exception:
         logger.exception("Failed to load PSI trend data.")
 
+    if not fig.data:
+        fig.add_annotation(
+            text="No measurements available yet",
+            x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False,
+            font=dict(color="#91a4b7", size=14),
+        )
     fig.update_layout(**layout)
+    fig.update_layout(uirevision="overview")
     return fig
 
 
@@ -210,10 +218,11 @@ def update_f1_trend(_n):
             rows = (
                 session.query(DriftResult)
                 .filter(DriftResult.drift_type == "concept")
-                .order_by(DriftResult.timestamp)
+                .order_by(desc(DriftResult.timestamp), desc(DriftResult.id))
                 .limit(100)
                 .all()
             )
+        rows = list(reversed(rows))
         if rows:
             timestamps = []
             f1_values = []
@@ -234,7 +243,14 @@ def update_f1_trend(_n):
     except Exception:
         logger.exception("Failed to load F1 trend data.")
 
+    if not fig.data:
+        fig.add_annotation(
+            text="No measurements available yet",
+            x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False,
+            font=dict(color="#91a4b7", size=14),
+        )
     fig.update_layout(**layout)
+    fig.update_layout(uirevision="overview")
     return fig
 
 
@@ -274,7 +290,14 @@ def update_prediction_volume(_n):
     except Exception:
         logger.exception("Failed to load prediction volume data.")
 
+    if not fig.data:
+        fig.add_annotation(
+            text="No measurements available yet",
+            x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False,
+            font=dict(color="#91a4b7", size=14),
+        )
     fig.update_layout(**layout)
+    fig.update_layout(uirevision="overview")
     return fig
 
 
@@ -331,7 +354,7 @@ def update_recent_alerts(_n):
     Input("interval-refresh", "n_intervals"),
 )
 def update_health_badge(_n):
-    now_str = datetime.now().strftime("%H:%M:%S")
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     try:
         db = _safe_db()
         with db.get_session() as session:
@@ -359,7 +382,7 @@ def update_health_badge(_n):
                     text = "Drift Critical"
                     
                 return dot_class, text, color, f"{now_str}"
-            return "status-dot status-dot-green", "Healthy", "success", f"{now_str}"
+            return "status-dot status-dot-green", "No breach in latest metric", "success", f"{now_str}"
         return "status-dot status-dot-gray", "No Data", "secondary", f"{now_str}"
     except Exception:
         return "status-dot status-dot-gray", "Unknown", "secondary", f"{now_str}"

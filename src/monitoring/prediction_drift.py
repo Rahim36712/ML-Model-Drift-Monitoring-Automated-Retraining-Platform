@@ -144,6 +144,10 @@ class PredictionDriftDetector:
         p = np.asarray(p, dtype=np.float64).ravel()
         q = np.asarray(q, dtype=np.float64).ravel()
 
+        if len(p) == 0 or len(q) == 0 or not np.isfinite(p).all() or not np.isfinite(q).all():
+            raise ValueError("Prediction samples must be nonempty and finite")
+        if np.min(p) == np.max(p) == np.min(q) == np.max(q):
+            return 0.0
         # Shared bin edges over the union of both supports
         combined_min = min(float(p.min()), float(q.min()))
         combined_max = max(float(p.max()), float(q.max()))
@@ -189,10 +193,11 @@ class PredictionDriftDetector:
         current_positive_rate = float(current_predictions.mean())
         current_mean_confidence = float(current_confidences.mean())
 
+        shift = abs(current_positive_rate - self._baseline_positive_rate)
         # Severity assessment
-        if hellinger >= self._thresholds.hellinger.critical:
+        if hellinger >= self._thresholds.hellinger.critical or shift >= self._thresholds.distribution_shift.critical:
             severity = "critical"
-        elif hellinger >= self._thresholds.hellinger.warning:
+        elif hellinger >= self._thresholds.hellinger.warning or shift >= self._thresholds.distribution_shift.warning:
             severity = "warning"
         else:
             severity = "none"

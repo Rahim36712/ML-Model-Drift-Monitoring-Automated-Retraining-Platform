@@ -35,6 +35,8 @@ from sqlalchemy import (
     String,
     Text,
     create_engine,
+    event,
+    text,
 )
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
@@ -83,6 +85,10 @@ class Prediction(Base):  # type: ignore[misc]
     true_label: int | None = Column(Integer, nullable=True)
     latency_ms: float = Column(Float, nullable=False)
 
+    source = Column(String(32), default="api", nullable=False)
+    scenario = Column(String(32), default="live", nullable=False)
+    request_latency_ms = Column(Float, nullable=True)
+
     # Indexes for common queries (timestamp range scans, version filters)
     __table_args__ = (
         Index("ix_predictions_timestamp", "timestamp"),
@@ -109,6 +115,7 @@ class DriftResult(Base):  # type: ignore[misc]
 
     id: int = Column(Integer, primary_key=True, autoincrement=True)
     timestamp: datetime = Column(DateTime, default=_utcnow, nullable=False)
+    model_version = Column(String(64), nullable=True)
     drift_type: str = Column(String(32), nullable=False)
     metric_name: str = Column(String(64), nullable=False)
     metric_value: float = Column(Float, nullable=False)
@@ -143,6 +150,9 @@ class Alert(Base):  # type: ignore[misc]
     message: str = Column(Text, nullable=False)
     channel: str = Column(String(32), nullable=False)
     acknowledged: bool = Column(Boolean, default=False, nullable=False)
+    alert_key = Column(String(200), nullable=True)
+    delivery_json = Column(Text, default="{}", nullable=False)
+    occurrences = Column(Integer, default=1, nullable=False)
 
     def __repr__(self) -> str:
         return (
@@ -236,6 +246,10 @@ class DatabaseManager:
 
         self._ensure_sqlite_parent(db_url)
 
+        if db_url.startswith("sqlite:///") and ":memory:" not in db_url:
+            path = Path(db_url.removeprefix("sqlite:///"))
+            if not path.is_absolute():
+                db_url = "sqlite:///" + (PROJECT_ROOT / path).resolve().as_posix()
         self._db_url = db_url
         self._engine = create_engine(
             db_url,
@@ -245,6 +259,12 @@ class DatabaseManager:
             if db_url.startswith("sqlite")
             else {},
         )
+        if db_url.startswith("sqlite"):
+            @event.listens_for(self._engine, "connect")
+            def configure_sqlite(connection, _record):
+                connection.execute("PRAGMA journal_mode=WAL")
+                connection.execute("PRAGMA busy_timeout=10000")
+                connection.execute("PRAGMA foreign_keys=ON")
         self._session_factory: sessionmaker[Session] = sessionmaker(
             bind=self._engine,
             expire_on_commit=False,
@@ -256,6 +276,26 @@ class DatabaseManager:
     def init_db(self) -> None:
         """Create all tables defined on ``Base`` if they don't exist."""
         Base.metadata.create_all(self._engine)
+        # Idempotent, versioned additive migration. No destructive table rebuilds.
+        with self._engine.begin() as connection:
+            connection.execute(text("CREATE TABLE IF NOT EXISTS schema_versions (version INTEGER PRIMARY KEY)"))
+            connection.execute(text("INSERT OR IGNORE INTO schema_versions VALUES (1)"))
+            columns = {row[1] for row in connection.execute(text("PRAGMA table_info(predictions)"))}
+            for name, definition in [("source", "TEXT DEFAULT 'api'"), ("scenario", "TEXT DEFAULT 'live'"),
+                                     ("request_latency_ms", "FLOAT")]:
+                if name not in columns:
+                    connection.execute(text(f"ALTER TABLE predictions ADD COLUMN {name} {definition}"))
+            connection.execute(text("INSERT OR IGNORE INTO schema_versions VALUES (2)"))
+            connection.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS one_champion ON model_versions(is_production) WHERE is_production=1"))
+            drift_columns = {row[1] for row in connection.execute(text("PRAGMA table_info(drift_results)"))}
+            if "model_version" not in drift_columns:
+                connection.execute(text("ALTER TABLE drift_results ADD COLUMN model_version TEXT"))
+            alert_columns = {row[1] for row in connection.execute(text("PRAGMA table_info(alerts)"))}
+            for name, definition in [("alert_key", "TEXT"), ("delivery_json", "TEXT DEFAULT '{}'"),
+                                     ("occurrences", "INTEGER DEFAULT 1")]:
+                if name not in alert_columns:
+                    connection.execute(text(f"ALTER TABLE alerts ADD COLUMN {name} {definition}"))
+
         logger.info("Database tables created / verified.")
 
     @contextmanager
@@ -302,7 +342,7 @@ class DatabaseManager:
 # Module-level singleton
 # ===================================================================
 
-@lru_cache(maxsize=1)
+@lru_cache(maxsize=8)
 def get_database(db_url: str | None = None) -> DatabaseManager:
     """Return (and cache) the default ``DatabaseManager`` singleton.
 

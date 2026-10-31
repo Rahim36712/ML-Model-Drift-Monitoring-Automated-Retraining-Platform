@@ -1,0 +1,15 @@
+services:
+  driftwatch:
+    build: .
+    init: true
+    ports:
+      - "127.0.0.1:8000:8000"
+      - "127.0.0.1:8050:8050"
+      - "127.0.0.1:5000:5000"
+    volumes:
+      - driftwatch-data:/workspace/data/demo
+    environment:
+      MLFLOW_HOST: "0.0.0.0"
+    stop_grace_period: 30s
+volumes:
+  driftwatch-data:

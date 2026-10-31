@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Any
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class PredictionRequest(BaseModel):
@@ -28,6 +28,15 @@ class PredictionRequest(BaseModel):
         }}
     )
 
+    @field_validator("features")
+    @classmethod
+    def validate_features(cls, value):
+        import math
+        required = {f"V{i}" for i in range(1, 29)} | {"Amount"}
+        if set(value) != required or not all(math.isfinite(v) for v in value.values()):
+            raise ValueError("Provide exactly V1–V28 and Amount, all finite numeric values")
+        return value
+
 
 class PredictionResponse(BaseModel):
     """Inference output for a single prediction request."""
@@ -43,7 +52,7 @@ class PredictionResponse(BaseModel):
 class BatchPredictionRequest(BaseModel):
     """Batch features inputs."""
 
-    predictions: list[PredictionRequest] = Field(..., description="List of single prediction requests.")
+    predictions: list[PredictionRequest] = Field(..., min_length=1, max_length=1000, description="1–1000 prediction requests.")
 
 
 class BatchPredictionResponse(BaseModel):

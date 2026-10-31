@@ -1,35 +1,33 @@
 [build-system]
 requires = ["setuptools>=68.0", "wheel"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "mlops-drift-monitor"
-version = "1.0.0"
+version = "2.0.0"
 description = "ML Model Drift Monitor & Automated Retraining Platform"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.13"
 license = {text = "MIT"}
 
 dependencies = [
-    "fastapi>=0.115.0",
-    "uvicorn[standard]>=0.30.0",
-    "mlflow>=2.16.0",
-    "scikit-learn>=1.5.0",
-    "pandas>=2.2.0",
-    "numpy>=1.26.0",
-    "dash>=2.18.0",
-    "plotly>=5.24.0",
-    "dash-bootstrap-components>=1.6.0",
-    "pydantic>=2.9.0",
-    "pydantic-settings>=2.5.0",
-    "pyyaml>=6.0",
-    "sqlalchemy>=2.0",
-    "apscheduler>=3.10.0",
-    "requests>=2.32.0",
-    "httpx>=0.27.0",
-    "python-dotenv>=1.0.0",
-    "joblib>=1.4.0",
-    "imbalanced-learn>=0.12.0",
+    "fastapi==0.115.6",
+    "uvicorn==0.34.0",
+    "mlflow==2.19.0",
+    "scikit-learn==1.5.2",
+    "pandas==2.2.3",
+    "numpy==1.26.4",
+    "dash==2.18.2",
+    "plotly==5.24.1",
+    "dash-bootstrap-components==1.6.0",
+    "pydantic==2.10.4",
+    "pydantic-settings==2.7.0",
+    "PyYAML==6.0.2",
+    "python-dotenv==1.0.1",
+    "SQLAlchemy==2.0.36",
+    "requests==2.32.3",
+    "httpx==0.28.1",
+    "joblib==1.4.2",
 ]
 
 [project.optional-dependencies]
@@ -42,7 +40,7 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["src*"]
+include = ["src*", "scripts*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -51,3 +49,10 @@ pythonpath = ["."]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+
+[tool.setuptools.package-data]
+"src.dashboard" = ["assets/*.css", "assets/*.svg"]
+"src.config" = ["defaults/*.yaml"]
+
+[project.scripts]
+driftwatch = "scripts.run_demo:main"

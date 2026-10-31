@@ -137,21 +137,16 @@ class DataLoader:
         X = df[feature_names].values.copy()
         y = df[_TARGET_COLUMN].values.copy()
 
-        # Scale the Amount column (last feature column)
+        from src.models.bundle import validate_dataset
+        validate_dataset(df)
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.20, random_state=42, stratify=y,
+        )
         amount_idx = feature_names.index("Amount")
         scaler = StandardScaler()
-        X[:, amount_idx] = scaler.fit_transform(X[:, amount_idx].reshape(-1, 1)).ravel()
-
-        # Persist the fitted scaler
+        X_train[:, amount_idx] = scaler.fit_transform(X_train[:, amount_idx].reshape(-1, 1)).ravel()
+        X_test[:, amount_idx] = scaler.transform(X_test[:, amount_idx].reshape(-1, 1)).ravel()
         self.save_preprocessor(scaler)
-
-        X_train, X_test, y_train, y_test = train_test_split(
-            X,
-            y,
-            test_size=0.20,
-            random_state=42,
-            stratify=y,
-        )
 
         self.save_processed_data(X_train, X_test, y_train, y_test, feature_names)
 

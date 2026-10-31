@@ -21,11 +21,11 @@ model:
     random_state: 42
 
 api:
-  host: "0.0.0.0"
+  host: "127.0.0.1"
   port: 8000
 
 dashboard:
-  host: "0.0.0.0"
+  host: "127.0.0.1"
   port: 8050
   refresh_interval_ms: 5000
 
@@ -33,3 +33,8 @@ monitoring:
   check_interval_minutes: 5
   window_size: 500
   min_samples: 100
+
+promotion:
+  min_f1_improvement: 0.005
+  max_historical_f1_drop: 0.01
+  max_recall_drop: 0.02

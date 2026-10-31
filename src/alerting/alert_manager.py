@@ -130,25 +130,43 @@ class AlertManager:
             threshold: The threshold that was breached.
             message: Optional override for the formatted alert body.
         """
+        import json
+        from sqlalchemy import text
         formatted = message or self._format_alert_message(
             severity, drift_type, metric_name, metric_value, threshold,
         )
-
-        # 1. Persist in the database
-        self._store_alert(severity, drift_type, formatted)
-
-        # 2. Deduplication check
-        if self._is_duplicate(drift_type, metric_name):
-            logger.info(
-                "Alert suppressed (dedup): %s/%s within %d-min window.",
-                drift_type,
-                metric_name,
-                self._dedup_window_minutes,
-            )
-            return
-
-        # 3. Route to enabled channels
-        self._route_to_channels(formatted, severity, drift_type)
+        key = f"{severity}:{drift_type}:{metric_name}"
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=self._dedup_window_minutes)
+        with self._db.get_session() as session:
+            session.execute(text("BEGIN IMMEDIATE"))
+            existing = session.query(Alert).filter(
+                Alert.alert_key == key, Alert.timestamp >= cutoff,
+            ).order_by(Alert.timestamp.desc()).first()
+            if existing:
+                existing.occurrences += 1
+                return
+            row = Alert(severity=severity, drift_type=drift_type, message=formatted,
+                        channel="console", alert_key=key, delivery_json='{"console":"pending"}')
+            session.add(row)
+            session.flush()
+            alert_id = row.id
+        console = self._settings is None or self._settings.console.enabled
+        delivery = {"console": "sent" if console else "disabled"}
+        if console:
+            logger.warning("%s: %s", severity, formatted)
+        for name, notifier in [("slack", self._slack_notifier), ("email", self._email_notifier)]:
+            if notifier is None:
+                delivery[name] = "disabled"
+                continue
+            try:
+                sent = (notifier.send(subject="Model monitoring alert", message=formatted, severity=severity)
+                        if name == "email" else notifier.send(formatted, severity))
+                delivery[name] = "sent" if sent else "failed"
+            except Exception:
+                delivery[name] = "failed"
+                logger.exception("Alert channel failed: %s", name)
+        with self._db.get_session() as session:
+            session.get(Alert, alert_id).delivery_json = json.dumps(delivery)
 
     def get_active_alerts(self, limit: int = 20) -> list[Alert]:
         """Return the most recent unacknowledged alerts.

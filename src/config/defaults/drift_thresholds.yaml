@@ -1,0 +1,29 @@
+data_drift:
+  psi:
+    warning: 0.10
+    critical: 0.25
+  kl_divergence:
+    warning: 0.05
+    critical: 0.15
+
+prediction_drift:
+  hellinger:
+    warning: 0.10
+    critical: 0.20
+  distribution_shift:
+    warning: 0.05
+    critical: 0.15
+
+concept_drift:
+  accuracy_drop:
+    warning: 0.03
+    critical: 0.05
+  f1_drop:
+    warning: 0.03
+    critical: 0.05
+  precision_drop:
+    warning: 0.05
+    critical: 0.10
+  recall_drop:
+    warning: 0.05
+    critical: 0.10

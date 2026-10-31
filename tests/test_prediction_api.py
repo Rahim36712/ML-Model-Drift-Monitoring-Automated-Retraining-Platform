@@ -1,109 +1,98 @@
-"""Integration tests for the FastAPI prediction and serving endpoints.
+"""Real HTTP contracts, validation, batch equivalence, and authentication."""
 
-Verifies serving logic, single/batch prediction schemas, and ground-truth mapping.
-"""
-
-from __future__ import annotations
-
-import unittest
 from fastapi.testclient import TestClient
 import numpy as np
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.preprocessing import StandardScaler
-
+import pytest
 from src.api.app import create_app
 from src.pipeline.deployer import ModelProvider
-from src.data.database import get_database
+from src.runtime import management_token
 
 
 class DummyModel:
-    """Mock model implementing scikit-learn classification interfaces."""
-    def predict(self, X: np.ndarray) -> np.ndarray:
-        return np.zeros(X.shape[0], dtype=int)
+    calls = 0
 
-    def predict_proba(self, X: np.ndarray) -> np.ndarray:
-        # returns [[0.95, 0.05]] for each sample
-        res = np.zeros((X.shape[0], 2))
-        res[:, 0] = 0.95
-        res[:, 1] = 0.05
-        return res
+    def predict(self, X):
+        return (X[:, 0] > 0).astype(int)
 
-
-class DummyPreprocessor:
-    """Mock preprocessor implementing StandardScaler transform interfaces."""
-    def transform(self, X: np.ndarray) -> np.ndarray:
-        return X.copy()
+    def predict_proba(self, X):
+        self.calls += 1
+        prob = np.where(X[:, 0] > 0, 0.8, 0.05)
+        return np.column_stack([1 - prob, prob])
 
 
-class TestPredictionAPI(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls) -> None:
-        # Configure in-memory database to be used by the API instance
-        cls.db = get_database("sqlite:///:memory:")
-        cls.db.init_db()
-        
-        # Deploy a mock model inside serving cache so endpoints don't return 503
-        cls.mock_model = DummyModel()
-        cls.mock_preprocessor = DummyPreprocessor()
-        ModelProvider.set_active_model(
-            model=cls.mock_model,
-            preprocessor=cls.mock_preprocessor,
-            version=1,
-            mlflow_run_id="mock_run_id_123"
-        )
-        
-        # Instantiate test client
-        cls.app = create_app()
-        cls.client = TestClient(cls.app)
-
-    def test_health_check(self) -> None:
-        resp = self.client.get("/health")
-        self.assertEqual(resp.status_code, 200)
-        self.assertEqual(resp.json()["status"], "ok")
-
-    def test_single_prediction(self) -> None:
-        features = {f"V{i}": 0.0 for i in range(1, 29)}
-        features["Amount"] = 50.0
-        
-        resp = self.client.post("/predict", json={"features": features})
-        self.assertEqual(resp.status_code, 200)
-        
-        data = resp.json()
-        self.assertIn("prediction_id", data)
-        self.assertEqual(data["predicted_label"], 0)
-        self.assertAlmostEqual(data["confidence"], 0.05)
-        self.assertEqual(data["model_version"], "1")
-
-    def test_batch_prediction(self) -> None:
-        features = {f"V{i}": 0.0 for i in range(1, 29)}
-        features["Amount"] = 50.0
-        
-        payload = {
-            "predictions": [
-                {"features": features},
-                {"features": features}
-            ]
-        }
-        
-        resp = self.client.post("/predict/batch", json=payload)
-        self.assertEqual(resp.status_code, 200)
-        
-        data = resp.json()
-        self.assertEqual(len(data["predictions"]), 2)
-        self.assertEqual(data["predictions"][0]["predicted_label"], 0)
-
-    def test_submit_ground_truth(self) -> None:
-        # First log a prediction to get a valid prediction_id
-        features = {f"V{i}": 0.0 for i in range(1, 29)}
-        features["Amount"] = 50.0
-        resp = self.client.post("/predict", json={"features": features})
-        pred_id = resp.json()["prediction_id"]
-        
-        # Submit ground truth
-        gt_resp = self.client.post(f"/ground-truth/{pred_id}", json={"true_label": 0})
-        self.assertEqual(gt_resp.status_code, 200)
-        self.assertTrue(gt_resp.json()["success"])
+@pytest.fixture
+def client(runtime):
+    with TestClient(create_app()) as client:
+        ModelProvider.set_active_model(DummyModel(), None, 1, "test")
+        yield client
 
 
-if __name__ == "__main__":
-    unittest.main()
+def features(value=0):
+    return {**{f"V{i}": value for i in range(1, 29)}, "Amount": 50.0}
+
+
+def test_single_batch_equivalence_and_vectorization(client):
+    payload = {"features": features(1)}
+    single = client.post("/predict", json=payload)
+    assert single.status_code == 200
+    snapshot = ModelProvider.get_snapshot()
+    before = snapshot.model.calls
+    batch = client.post("/predict/batch", json={"predictions": [payload, payload]}).json()
+    assert snapshot.model.calls - before == 1
+    assert all(row["confidence"] == single.json()["confidence"] for row in batch["predictions"])
+    prediction_id = single.json()["prediction_id"]
+    assert client.post(f"/ground-truth/{prediction_id}", json={"true_label": 1}).status_code == 200
+    assert client.get("/ready").status_code == 200
+    assert client.get("/health").json()["status"] == "ok"
+    assert "X-Process-Time" in single.headers
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"predictions": []},
+        {"predictions": [{"features": {}}]},
+        {"predictions": [{"features": features()}] * 1001},
+    ],
+)
+def test_invalid_batches(client, payload):
+    assert client.post("/predict/batch", json=payload).status_code == 422
+
+
+def test_nonfinite_feature_and_management_auth(client):
+    value = features()
+    value["Amount"] = "NaN"
+    assert client.post("/predict", json={"features": value}).status_code == 422
+    assert client.post("/models/retrain").status_code == 401
+    headers = {"X-MLOps-Token": management_token()}
+    first = client.post("/models/retrain", headers=headers).json()
+    second = client.post("/models/retrain", headers=headers).json()
+    assert first["job_id"] == second["job_id"]
+    assert not second["created"]
+    assert client.get("/jobs/" + first["job_id"], headers=headers).status_code == 200
+    assert client.get("/dashboard/snapshot", headers=headers).status_code == 200
+
+
+def test_missing_model_readiness(client):
+    ModelProvider.set_active_model(None, None, None)
+    assert client.get("/ready").status_code == 503
+    assert client.post("/predict", json={"features": features()}).status_code == 503
+
+
+def test_reset_is_confirmed_and_keeps_user_predictions(client):
+    headers = {"X-MLOps-Token": management_token()}
+    user_id = client.post("/predict", json={"features": features()}).json()["prediction_id"]
+    demo = client.post(
+        "/demo/predict/batch", headers=headers, json={"predictions": [{"features": features()}]}
+    ).json()
+    demo_id = demo["predictions"][0]["prediction_id"]
+    assert (
+        client.post("/demo/reset", headers=headers, json={"confirmation": "wrong"}).status_code
+        == 422
+    )
+    assert (
+        client.post("/demo/reset", headers=headers, json={"confirmation": "RESET DEMO"}).status_code
+        == 200
+    )
+    assert client.post(f"/ground-truth/{user_id}", json={"true_label": 0}).status_code == 200
+    assert client.post(f"/ground-truth/{demo_id}", json={"true_label": 0}).status_code == 404

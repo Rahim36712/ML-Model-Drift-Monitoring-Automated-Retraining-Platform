@@ -37,9 +37,9 @@ def create_navbar() -> dbc.Navbar:
                             className="status-dot status-dot-gray",
                         ),
                         dbc.Badge(
-                            "Healthy",
+                            "Awaiting drift check",
                             id="health-badge-text",
-                            color="success",
+                            color="secondary",
                             pill=True,
                             className="me-3",
                             style={"fontSize": "0.75rem"},
@@ -52,7 +52,7 @@ def create_navbar() -> dbc.Navbar:
                 html.Small(
                     [
                         html.Span(
-                            "Last updated: ",
+                            "Dashboard refreshed (UTC): ",
                             style={"color": "var(--color-text-muted)"},
                         ),
                         html.Span(
@@ -65,7 +65,7 @@ def create_navbar() -> dbc.Navbar:
                 ),
             ),
         ],
-        className="ms-auto d-flex align-items-center",
+        className="ms-auto d-flex align-items-center gap-2 flex-wrap",
         navbar=True,
     )
 

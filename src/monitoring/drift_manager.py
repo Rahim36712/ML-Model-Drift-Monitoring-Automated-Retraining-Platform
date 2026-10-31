@@ -77,7 +77,7 @@ class DriftSummary:
     data_drift: DataDriftResult | None = None
     prediction_drift: PredictionDriftResult | None = None
     concept_drift: ConceptDriftResult | None = None
-    overall_status: str = "healthy"
+    overall_status: str = "unavailable"
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     checks_performed: list[str] = field(default_factory=list)
 
@@ -157,6 +157,8 @@ class DriftManager:
             self._latest_summary = summary
             return summary
 
+        self._window_start = min(row.timestamp for row in recent_predictions)
+        self._window_end = max(row.timestamp for row in recent_predictions)
         # --- Extract raw arrays from the prediction records -----------
         features_matrix = self._extract_features(recent_predictions, feature_names)
         predicted_labels = np.array(
@@ -316,7 +318,7 @@ class DriftManager:
             severities.append(summary.concept_drift.severity)
 
         if not severities:
-            return "healthy"
+            return "unavailable"
 
         worst = max(severities, key=lambda s: _SEVERITY_ORDER.get(s, 0))
         return "healthy" if worst == "none" else worst
@@ -338,13 +340,14 @@ class DriftManager:
                     drift_type="data",
                     metric_name="psi",
                     metric_value=d.overall_psi,
-                    threshold=0.0,  # overall; per-feature thresholds vary
+                    threshold=self._data_detector._thresholds.psi.warning,
                     is_breached=d.is_drifted,
-                    window_start=now,
-                    window_end=now,
+                    window_start=getattr(self, "_window_start", now),
+                    window_end=getattr(self, "_window_end", now),
                     details_json=json.dumps(
                         {
                             "feature_psi": d.feature_psi,
+                            "feature_kl": d.feature_kl,
                             "drifted_features": d.drifted_features,
                             "severity": d.severity,
                         }
@@ -360,10 +363,10 @@ class DriftManager:
                     drift_type="prediction",
                     metric_name="hellinger",
                     metric_value=p.hellinger_distance,
-                    threshold=0.0,
+                    threshold=self._prediction_detector._thresholds.hellinger.warning,
                     is_breached=p.is_drifted,
-                    window_start=now,
-                    window_end=now,
+                    window_start=getattr(self, "_window_start", now),
+                    window_end=getattr(self, "_window_end", now),
                     details_json=json.dumps(
                         {
                             "baseline_positive_rate": p.baseline_positive_rate,
@@ -390,8 +393,8 @@ class DriftManager:
                             metric_value=drop_val,
                             threshold=0.0,
                             is_breached=True,
-                            window_start=now,
-                            window_end=now,
+                            window_start=getattr(self, "_window_start", now),
+                            window_end=getattr(self, "_window_end", now),
                             details_json=json.dumps(
                                 {
                                     "current_metrics": c.current_metrics,
@@ -411,8 +414,8 @@ class DriftManager:
                         metric_value=0.0,
                         threshold=0.0,
                         is_breached=False,
-                        window_start=now,
-                        window_end=now,
+                        window_start=getattr(self, "_window_start", now),
+                        window_end=getattr(self, "_window_end", now),
                         details_json=json.dumps(
                             {
                                 "current_metrics": c.current_metrics,
@@ -423,6 +426,8 @@ class DriftManager:
                     )
                 )
 
+        for row in rows:
+            row.model_version = getattr(self, "_model_version", None)
         if rows:
             with self._db.get_session() as session:
                 session.add_all(rows)

@@ -1,0 +1,13 @@
+.git
+.venv
+**/__pycache__
+.pytest_cache
+.ruff_cache
+data/demo
+data/raw
+data/processed
+data/reference
+mlruns
+models
+.env
+*.log

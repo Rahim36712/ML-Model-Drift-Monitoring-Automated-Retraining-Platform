@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import desc, func
+from sqlalchemy import desc, func, func
 
 from src.data.database import DriftResult, RetrainingEvent
 
@@ -133,7 +133,7 @@ class RetrainingDecisionEngine:
             if data_drift is not None:
                 overall_psi: float = getattr(data_drift, "overall_psi", 0.0)
                 psi_critical: float = self._thresholds.data_drift.psi.critical
-                if overall_psi > psi_critical:
+                if overall_psi >= psi_critical or getattr(data_drift, "severity", "none") == "critical":
                     triggered_rules.append("critical_data_drift")
                     reasons.append(
                         f"Critical data drift: PSI {overall_psi:.4f} > "
@@ -151,9 +151,9 @@ class RetrainingDecisionEngine:
                 metric_deltas: dict[str, float] = getattr(
                     concept_drift, "metric_deltas", {},
                 )
-                f1_delta = abs(metric_deltas.get("f1", 0.0))
+                f1_delta = max(0.0, -metric_deltas.get("f1", 0.0))
                 f1_critical: float = self._thresholds.concept_drift.f1_drop.critical
-                if f1_delta > f1_critical:
+                if f1_delta >= f1_critical:
                     triggered_rules.append("f1_degradation")
                     reasons.append(
                         f"F1 degradation: |Δf1| {f1_delta:.4f} > "
@@ -170,7 +170,7 @@ class RetrainingDecisionEngine:
                 overall_psi_val: float = getattr(data_drift, "overall_psi", 0.0)
                 psi_warning: float = self._thresholds.data_drift.psi.warning
                 deltas = getattr(concept_drift, "metric_deltas", {})
-                f1_delta_val = abs(deltas.get("f1", 0.0))
+                f1_delta_val = max(0.0, -deltas.get("f1", 0.0))
 
                 if overall_psi_val > psi_warning and f1_delta_val > 0.02:
                     triggered_rules.append("moderate_drift_with_perf_drop")
@@ -307,7 +307,7 @@ class RetrainingDecisionEngine:
                     trigger_reason=decision.reason,
                     old_version=0,  # filled by the retraining pipeline
                     old_f1=0.0,     # filled by the retraining pipeline
-                    status="STARTED" if decision.should_retrain else "REJECTED",
+                    status="DECISION",
                 )
                 session.add(event)
             logger.info(
@@ -339,18 +339,16 @@ class RetrainingDecisionEngine:
         try:
             with self._db.get_session() as session:
                 results = (
-                    session.query(DriftResult.is_breached)
+                    session.query(DriftResult.timestamp, func.max(DriftResult.is_breached))
+                    .group_by(DriftResult.timestamp)
                     .order_by(desc(DriftResult.timestamp))
-                    .limit(50)
-                    .all()
+                    .limit(50).all()
                 )
-
             count = 0
-            for (is_breached,) in results:
-                if is_breached:
-                    count += 1
-                else:
+            for _, is_breached in results:
+                if not is_breached:
                     break
+                count += 1
             return count
         except Exception:  # noqa: BLE001
             logger.exception("Error counting consecutive warnings.")
